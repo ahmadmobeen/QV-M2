@@ -9,6 +9,11 @@ import torch
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
+import argparse
+
+# Enable loading argparse.Namespace in PyTorch 2.6+
+if hasattr(torch.serialization, 'add_safe_globals'):
+    torch.serialization.add_safe_globals([argparse.Namespace])
 
 from FlashMMR.config import TestOptions
 from FlashMMR.start_end_dataset import (
@@ -424,13 +429,13 @@ def setup_model(opt):
 
     if opt.resume_adapter is not None:
         logger.info(f"Load adapter checkpoint from {opt.resume_adapter}")
-        adapter_checkpoint = torch.load(opt.resume_adapter)
+        adapter_checkpoint = torch.load(opt.resume_adapter, weights_only=False)
         adapter_state_dict = {k: v for k, v in adapter_checkpoint['state_dict'].items() if k.startswith('adapter')}
         model.load_state_dict(adapter_state_dict, strict=False)
 
     if opt.resume is not None:
         logger.info(f"Load checkpoint from {opt.resume}")
-        checkpoint = torch.load(opt.resume, map_location="cpu")
+        checkpoint = torch.load(opt.resume, map_location="cpu", weights_only=False)
 
         from collections import OrderedDict
 
