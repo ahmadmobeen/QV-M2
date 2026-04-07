@@ -36,6 +36,9 @@ class BaseOptions(object):
                                  "Use small portion for debug purposes. Note this is different from --debug, "
                                  "which works by breaking the loops, typically they are not used together.")
         parser.add_argument("--results_root", type=str, default="results")
+        parser.add_argument("--save_interval", type=int, default=10, help="save checkpoint every N epochs")
+        parser.add_argument("--eval_epoch", type=int, default=1, help="evaluate every N epochs")
+        parser.add_argument("--max_es_cnt", type=int, default=-1, help="early stop after N epochs of no improvement")
         parser.add_argument("--exp_id", type=str, default=None, help="id of this run, required at training")
         parser.add_argument("--seed", type=int, default=2024, help="random seed")
         parser.add_argument("--device", type=int, default=0, help="0 cuda, -1 cpu")
@@ -50,14 +53,10 @@ class BaseOptions(object):
         parser.add_argument("--lr_drop", type=int, default=400, help="drop learning rate to 1/10 every lr_drop epochs")
         parser.add_argument("--wd", type=float, default=1e-4, help="weight decay")
         parser.add_argument("--n_epoch", type=int, default=700, help="number of epochs to run")
-        parser.add_argument("--max_es_cnt", type=int, default=200,
-                            help="number of epochs to early stop, use -1 to disable early stop")
         parser.add_argument("--bsz", type=int, default=32, help="mini-batch size")
         parser.add_argument("--drop_last", type=bool, default=False, help="train_loader config")
         parser.add_argument("--eval_bsz", type=int, default=100,
                             help="mini-batch size at inference, for query")
-        parser.add_argument("--eval_epoch", type=int, default=2,
-                            help="inference epoch")
         parser.add_argument("--grad_clip", type=float, default=0.1, help="perform gradient clip, -1: disable")
         parser.add_argument("--eval_untrained", action="store_true", help="Evaluate on un-trained model")
         parser.add_argument("--resume", type=str, default=None,
@@ -215,12 +214,15 @@ class BaseOptions(object):
                                                     #  str(opt.enc_layers) + str(opt.dec_layers) + str(opt.t2v_layers) + str(opt.moment_layers) + str(opt.dummy_layers) + str(opt.sent_layers),
                                                     #  'ndum_' + str(opt.num_dummies), 'nprom_' + str(opt.num_prompts) + '_' + str(opt.total_prompts)])) 
             
+            print(f"Creating results directory: {opt.results_dir}")
             mkdirp(opt.results_dir)
             save_fns = ['FlashMMR/model.py', 'FlashMMR/transformer.py']
             for save_fn in save_fns:
+                print(f"Copying {save_fn} to {opt.results_dir}")
                 shutil.copyfile(save_fn, os.path.join(opt.results_dir, os.path.basename(save_fn)))
 
             # save a copy of current code
+            print("Zipping code...")
             code_dir = os.path.dirname(os.path.realpath(__file__))
             code_zip_filename = os.path.join(opt.results_dir, "code.zip")
             make_zipfile(code_dir, code_zip_filename,
@@ -228,6 +230,7 @@ class BaseOptions(object):
                          exclude_dirs_substring="results",
                          exclude_dirs=["results", "debug_results", "__pycache__"],
                          exclude_extensions=[".pyc", ".ipynb", ".swap"], )
+            print("Code zipped.")
 
         self.display_save(opt)
 

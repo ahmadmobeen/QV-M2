@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 import random
+from tqdm import tqdm
 import logging
 from os.path import join
 from utils.basic_utils import load_jsonl, l2_normalize_np_array
@@ -156,7 +157,8 @@ class StartEndDataset(Dataset):
 
     def _preload_data(self):
         self.preloaded_data = []
-        for index in range(len(self.data)):
+        logger.info(f"Preloading {len(self.data)} examples...")
+        for index in tqdm(range(len(self.data)), desc=f"Preloading {self.dset_name}"):
             meta = self.data[index]
             model_inputs = self._load_model_inputs(meta)
             self.preloaded_data.append((meta, model_inputs))
