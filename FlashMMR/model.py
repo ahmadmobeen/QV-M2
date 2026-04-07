@@ -80,6 +80,7 @@ class FlashMMR(nn.Module):
                 max_num_moment=50,
                 merge_cls_sal=True,
                 pyramid_cfg=None,
+                pooling_cfg=None,
                 coord_head_cfg=None,
                 args=None):
         """ Initializes the model."""
@@ -122,6 +123,7 @@ class FlashMMR(nn.Module):
 
         # build muti-scale pyramid
         self.pyramid = build_adapter(pyramid_cfg, hidden_dim, strides)
+        self.pooling = build_adapter(pooling_cfg, hidden_dim)
         self.conf_head = ConfidenceScorer(in_channels=256, out_channels=256, kernel_size=(1, args.kernel_size), num_conv_layers=args.num_conv_layers, num_mlp_layers = args.num_mlp_layers)
         self.class_head = ConfidenceScorer(in_channels=256, out_channels=256, kernel_size=(1, args.kernel_size), num_conv_layers=args.num_conv_layers, num_mlp_layers = args.num_mlp_layers)
         self.coef = nn.Parameter(torch.ones(len(strides)))
@@ -134,8 +136,16 @@ class FlashMMR(nn.Module):
 
 
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
-        if self.training:
-            raise RuntimeError("Only supports inference.")
+        if vid is not None:
+            # For QVHighlights, we extract original vid if needed for negative sampling
+            _count = [v.count('_') for v in vid]
+            if self.args.dset_name == 'hl':
+                _position_to_cut = [find_nth(v, '_', _count[i]-1) for i, v in enumerate(vid)]
+                ori_vid = [v[:_position_to_cut[i]] for i, v in enumerate(vid)]
+            else:
+                ori_vid = [v for v in vid]
+        else:
+            ori_vid = None
 
         # Project inputs to the same hidden dimension
         src_vid = self.input_vid_proj(src_vid)
@@ -198,8 +208,12 @@ class FlashMMR(nn.Module):
 
         video_emb = video_emb.permute(1, 0, 2)
         video_msk = (~video_msk).int()
-        pymid, _ = self.pyramid(video_emb, video_msk, return_mask=False)
-        point = self.generator(pymid)
+        pymid, pymid_msk = self.pyramid(video_emb, video_msk, return_mask=True)
+        point = self.generator(pymid) # [num_pts, 4]
+        
+        bs = src_vid.shape[0]
+        # Expand point to [bs, num_pts, 4]
+        point = point.unsqueeze(0).repeat(bs, 1, 1)
 
         with torch.autocast("cuda", enabled=False):
             video_emb = video_emb.float()
@@ -208,6 +222,9 @@ class FlashMMR(nn.Module):
             out_conf = torch.cat(pymid, dim=1)
             out_conf = self.conf_head(out_conf)
             out_class = self.x * out_class + (1 - self.x) * out_conf
+            
+            # For training losses, we also need query_emb
+            query_emb = self.pooling(src_txt.float(), src_txt_mask)
 
             out_coord = None
             if self.coord_head is not None and len(pymid) > 0:
@@ -221,31 +238,55 @@ class FlashMMR(nn.Module):
             raise RuntimeError("coord_head did not produce localization results; inference cannot proceed.")
 
         bs = src_vid.shape[0]
-        if bs != 1:
-            raise AssertionError("batch size larger than 1 is not supported for inference")
+        # Post-process for inference if bs=1
+        if not self.training and bs == 1:
+            out_class_inf = out_class.sigmoid()
+            boundary = out_coord[0]
+            boundary[:, 0] *= -1
+            boundary *= point[0, :, 3, None].repeat(1, 2)
+            boundary += point[0, :, 0, None].repeat(1, 2)
+            boundary /= 1 / self.args.clip_length
+            boundary = torch.cat((boundary, out_class_inf[0]), dim=-1)
 
-        out_class = out_class.sigmoid()
-
-        boundary = out_coord[0]
-        boundary[:, 0] *= -1
-        boundary *= point[:, 3, None].repeat(1, 2)
-        boundary += point[:, 0, None].repeat(1, 2)
-        boundary /= 1 / self.args.clip_length
-        boundary = torch.cat((boundary, out_class[0]), dim=-1)
-
-        _, inds = out_class[0, :, 0].sort(descending=True)
-        boundary = boundary[inds[: self.max_num_moment]]
+            _, inds = out_class_inf[0, :, 0].sort(descending=True)
+            boundary = boundary[inds[: self.max_num_moment]]
+        else:
+            boundary = None
 
         output = dict(
             saliency_scores=saliency_scores,
-            _out=dict(
+            video_emb=video_emb,
+            query_emb=query_emb,
+            video_msk=video_msk,
+            out_class=out_class,
+            out_coord=out_coord,
+            point=point,
+            pymid_msk=pymid_msk,
+        )
+
+        if not self.training:
+            output["_out"] = dict(
                 label=None if targets is None else targets.get("label", [None])[0],
                 video_msk=video_msk,
                 saliency=saliency_scores[0],
-                boundary=boundary,
-            ),
-        )
-
+                boundary=None if out_coord is None else boundary,
+            )
+        
+        # Handle negative samples for training
+        if self.training and self.args.use_neg:
+            neg_vid = ori_vid[1:] + ori_vid[:1]
+            real_neg_mask = torch.Tensor(element_wise_list_equal(ori_vid, neg_vid)).to(src_txt.device)
+            real_neg_mask = (real_neg_mask == False)
+            
+            if real_neg_mask.sum() != 0:
+                # Basic negative sampling: shift queries
+                src_txt_neg = torch.cat([src_txt[1:], src_txt[0:1]], dim=0)
+                src_txt_mask_neg = torch.cat([src_txt_mask[1:], src_txt_mask[0:1]], dim=0)
+                
+                # We would need to run the transformer again for negatives if we want full NCE
+                # But for now, we'll follow FlashVTG's pattern if possible
+                pass # Implementation can be expanded if needed for specific losses
+        
         return output
 
 
@@ -303,6 +344,7 @@ def build_model(args):
         buffer_size=args.cfg.model.buffer_size,
         max_num_moment=args.cfg.model.max_num_moment,
         pyramid_cfg=args.cfg.model.pyramid_cfg,
+        pooling_cfg=args.cfg.model.pooling_cfg,
         coord_head_cfg=args.cfg.model.coord_head_cfg,
         args=args
     )
