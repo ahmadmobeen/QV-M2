@@ -45,7 +45,8 @@ class SampledNCELoss(nn.Module):
 
         scale = self.scale.exp().clamp(max=self.max_scale)
         i_sim = F.cosine_similarity(video_emb, query_emb, dim=-1) * scale
-        i_sim = i_sim + torch.where(loss_msk > 0, .0, float('-inf'))
+        # Safety: Use a large negative constant instead of -inf to prevent log_softmax NaNs
+        i_sim = i_sim + torch.where(loss_msk > 0, .0, -10000.0)
 
         loss = 0
 
@@ -121,7 +122,7 @@ class BundleLoss(nn.Module):
 
     def get_target(self, data):
         cls_tgt, reg_tgt = [], []
-        print(f"get_target: boundary={data['boundary'].shape}, fps={data['fps'].shape}, point={data['point'].shape}", flush=True)
+        # Diagnostic tracer removed for production
         for i in range(data['boundary'].size(0)):
             gt_bnd = data['boundary'][i] * data['fps'][i]
             gt_cls = gt_bnd.new_ones(gt_bnd.size(0), 1).long()
@@ -138,9 +139,10 @@ class BundleLoss(nn.Module):
         src = data['out_class'].squeeze(-1)
         msk = torch.cat(data['pymid_msk'], dim=1).squeeze(-1).bool()
         
-        print(f"loss_cls: src={src.shape}, cls_tgt={cls_tgt.shape}, msk={msk.shape}", flush=True)
-        loss_cls = self._loss_cls(src, cls_tgt, weight=msk, avg_factor=msk.sum())
-        print(f"loss_cls done: {loss_cls.item()}", flush=True)
+        avg_factor = max(msk.sum().item(), 1.0)
+        loss_cls = self._loss_cls(src, cls_tgt, weight=msk, avg_factor=avg_factor)
+        if msk.sum() == 0:
+            loss_cls = loss_cls * 0.0
 
         output['loss_cls'] = loss_cls
         return output
@@ -149,9 +151,10 @@ class BundleLoss(nn.Module):
         src = data['out_coord'] # [bs, 139, 2]
         msk = cls_tgt.unsqueeze(2).repeat(1, 1, 2).bool() # [bs, 139, 2]
         
-        print(f"loss_reg: src={src.shape}, reg_tgt={reg_tgt.shape}, msk={msk.shape}", flush=True)
-        loss_reg = self._loss_reg(src, reg_tgt, weight=msk, avg_factor=msk.sum())
-        print(f"loss_reg done: {loss_reg.item()}", flush=True)
+        avg_factor = max(msk.sum().item(), 1.0)
+        loss_reg = self._loss_reg(src, reg_tgt, weight=msk, avg_factor=avg_factor)
+        if msk.sum() == 0:
+            loss_reg = loss_reg * 0.0
 
         output['loss_reg'] = loss_reg
         return output

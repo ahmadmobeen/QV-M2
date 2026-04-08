@@ -343,6 +343,7 @@ def multi_head_attention_forward(query: Tensor,
         v = static_v
 
     src_len = k.size(1)
+        # Tracer removed
 
     if key_padding_mask is not None:
         assert key_padding_mask.size(0) == bsz
@@ -385,7 +386,7 @@ def multi_head_attention_forward(query: Tensor,
 
     attn_output = torch.bmm(attn_output_weights, v)
     assert list(attn_output.size()) == [bsz * num_heads, tgt_len, v_head_dim]
-    attn_output = attn_output.transpose(0, 1).contiguous().view(tgt_len, bsz, out_dim)
+    attn_output = attn_output.transpose(0, 1).contiguous().view(tgt_len, bsz, int(out_dim))
     attn_output = linear(attn_output, out_proj_weight, out_proj_bias)
 
     if need_weights:

@@ -14,14 +14,15 @@ from blocks.generator import PointGenerator
 
 
 def init_weights(module):
-    if isinstance(module, (nn.Linear, nn.Embedding)):
-        module.weight.data.normal_(mean=0.0, std=0.02)
+    if isinstance(module, nn.Linear):
+        nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0)
+    elif isinstance(module, nn.Embedding):
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
     elif isinstance(module, nn.LayerNorm):
-        module.bias.data.zero_()
-        module.weight.data.fill_(1.0)
-
-    if isinstance(module, nn.Linear) and module.bias is not None:
-        module.bias.data.zero_()
+        nn.init.constant_(module.bias, 0)
+        nn.init.constant_(module.weight, 1.0)
 
 def find_nth(vid, underline, n):
     max_len = len(vid)
@@ -54,7 +55,7 @@ class ConfidenceScorer(nn.Module):
                 self.convs.append(nn.Conv2d(in_channels, out_channels, kernel_size, padding=(0, kernel_size[1] // 2)))
             else:
                 self.convs.append(nn.Conv2d(out_channels, out_channels, kernel_size, padding=(0, kernel_size[1] // 2)))
-            self.activations.append(nn.ReLU(inplace=True))
+            self.activations.append(nn.ReLU(inplace=False))
         
         self.fc = MLP(out_channels, out_channels // 2, 1, num_layers=num_mlp_layers)
     
@@ -116,8 +117,12 @@ class FlashMMR(nn.Module):
         self.use_txt_pos = use_txt_pos
         self.dummy_rep_token = torch.nn.Parameter(torch.randn(args.num_dummies, hidden_dim))
         self.dummy_rep_pos = torch.nn.Parameter(torch.randn(args.num_dummies, hidden_dim))
-        normalize_before = False
-        input_txt_sa_proj = TransformerEncoderLayer(hidden_dim, 8, self.args.dim_feedforward, 0.1, "prelu", normalize_before)
+        nn.init.xavier_uniform_(self.dummy_rep_token.data.unsqueeze(0)) # Xavier expects 2D+; unsqueeze to 3D for init
+        nn.init.xavier_uniform_(self.dummy_rep_pos.data.unsqueeze(0))
+        self.dummy_rep_token.data.squeeze_(0)
+        self.dummy_rep_pos.data.squeeze_(0)
+        normalize_before = True
+        input_txt_sa_proj = TransformerEncoderLayer(hidden_dim, 8, self.args.dim_feedforward, 0.1, "relu", normalize_before)
         txtproj_encoder_norm = nn.LayerNorm(hidden_dim) if normalize_before else None
         self.txtproj_encoder = TransformerEncoder(input_txt_sa_proj, args.dummy_layers, txtproj_encoder_norm)
 
@@ -136,6 +141,10 @@ class FlashMMR(nn.Module):
 
 
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
+        # Defensive Clamping: Prevent feature outliers from exploding in the first LayerNorm
+        src_vid = torch.clamp(src_vid, -10, 10)
+        src_txt = torch.clamp(src_txt, -10, 10)
+
         if vid is not None:
             # For QVHighlights, we extract original vid if needed for negative sampling
             _count = [v.count('_') for v in vid]
@@ -150,9 +159,11 @@ class FlashMMR(nn.Module):
         # Project inputs to the same hidden dimension
         src_vid = self.input_vid_proj(src_vid)
         src_txt = self.input_txt_proj(src_txt)
+        
         # Add type embeddings
         src_vid = src_vid + self.token_type_embeddings(torch.full_like(src_vid_mask.long(), 1))
         src_txt = src_txt + self.token_type_embeddings(torch.zeros_like(src_txt_mask.long()))
+        
         # Add position embeddings
         pos_vid = self.position_embed(src_vid, src_vid_mask)
         if self.use_txt_pos:
@@ -182,12 +193,16 @@ class FlashMMR(nn.Module):
             src_key_padding_mask=~(src_txt_mask_dummy.bool()),
             pos=pos_txt_dummy,
         )
+        
         dummy_token = memory[: self.args.num_dummies].permute(1, 0, 2)
         pos_txt_dummy = pos_txt_dummy.permute(1, 0, 2)
 
         src_txt_dummy = torch.cat([dummy_token, src_txt], dim=1)
-        mask_txt_dummy = torch.tensor([[True] * self.args.num_dummies], device=src_txt_mask.device).repeat(
-            src_txt_mask.shape[0], 1
+        # Fix masking for Pre-Norm consistency
+        mask_txt_dummy = torch.ones(
+            (src_txt_mask.shape[0], self.args.num_dummies), 
+            dtype=torch.bool, 
+            device=src_txt_mask.device
         )
         src_txt_mask_dummy = torch.cat([mask_txt_dummy, src_txt_mask], dim=1)
 
@@ -196,7 +211,6 @@ class FlashMMR(nn.Module):
         pos = torch.cat([pos_vid, pos_txt_dummy], dim=1)
 
         video_length = src_vid.shape[1]
-
         video_emb, video_msk, _, _, saliency_scores = self.transformer(
             src,
             ~mask,
@@ -324,7 +338,7 @@ class LinearLayer(nn.Module):
             x = self.LayerNorm(x)
         x = self.net(x)
         if self.relu:
-            x = F.relu(x, inplace=True)
+            x = F.relu(x, inplace=False)
         return x  # (N, L, D)
 
 

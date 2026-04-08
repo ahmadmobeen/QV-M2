@@ -79,30 +79,28 @@ class Transformer(nn.Module):
                 # nn.init.xavier_uniform_(p)
                 nn.init.trunc_normal_(p, std=.02)
 
-    def forward(self, src, mask, pos_embed, video_length=None, saliency_proj1=None, saliency_proj2=None):
+    def forward(self, src, mask, pos_embed, video_length=75, saliency_proj1=None, saliency_proj2=None):
         """
-        Args:
-            src: (batch_size, L, d)
-            mask: (batch_size, L)
-            query_embed: (#queries, d)
-            pos_embed: (batch_size, L, d) the same as src
-            video length: feature shape
-            vlen: actual video length
-        Returns:
         """
+        if torch.isnan(src).any():
+            print("TRANSFORMER: NAN in src!", flush=True)
+        if torch.isnan(pos_embed).any():
+            print("TRANSFORMER: NAN in pos_embed!", flush=True)
+        # print(f"TRANSFORMER: src min={src.min().item()}, max={src.max().item()}", flush=True)
         # flatten NxCxHxW to HWxNxC
         bs, l, d = src.shape 
         src = src.permute(1, 0, 2)  # (L, batch_size, d)
         pos_embed = pos_embed.permute(1, 0, 2)   # (L, batch_size, d)
 
         t2v_src, attn_weights = self.t2v_encoder(src, src_key_padding_mask=mask, pos=pos_embed, video_length=video_length)
+        if torch.isnan(t2v_src).any():
+            print("TRANSFORMER: NAN in t2v_src!", flush=True)
 
         vid_fuse = t2v_src[:video_length]
         mask = mask[:, :video_length]
         pos_embed = pos_embed[:video_length]
         
         vid_fuse = self.encoder(vid_fuse, src_key_padding_mask=mask, pos=pos_embed)  # (L, batch_size, d)
-
         vid_mem = vid_fuse.transpose(0, 1)
         memory_global = vid_mem.mean(1)
         proj1_result = saliency_proj1(vid_mem)
@@ -110,6 +108,8 @@ class Transformer(nn.Module):
         proj2_result = proj2_result.unsqueeze(1)
 
         intermediate_result = proj1_result * proj2_result
+        # Safety Gate: Prevent dot-product overflow before summation
+        intermediate_result = torch.clamp(intermediate_result, -100, 100)
         saliency_scores = torch.sum(intermediate_result, dim=-1) / np.sqrt(d)
 
         return vid_fuse, mask, pos_embed, attn_weights, saliency_scores
@@ -311,7 +311,23 @@ class T2V_TransformerEncoderLayer(nn.Module):
                     src_mask: Optional[Tensor] = None,
                     src_key_padding_mask: Optional[Tensor] = None,
                     pos: Optional[Tensor] = None, dummy=True):
-        pass
+        src2 = self.norm2(src) # Following DETR-style pre-norm in cross-attn
+        video_length = src.shape[0] - self.args.num_dummies if not dummy else 75
+        
+        q = k = self.with_pos_embed(src2, pos)
+        v = src2
+        
+        src2, attn_weights = self.self_attn(q, k, v, attn_mask=src_mask,
+                                            key_padding_mask=src_key_padding_mask, dummy=dummy)
+
+        src2 = src[:video_length] + self.dropout1(src2)
+        src3 = self.norm1(src2)
+        src3 = self.linear2(self.dropout(self.activation(self.linear1(src3))))
+        src2 = src2 + self.dropout2(src3)
+        # Note: In cross-attention, we often skip the final norm if already normalized at block entry
+        
+        src = torch.cat([src2, src[video_length:]])
+        return src, attn_weights
 
 
     def forward(self, src,
@@ -363,7 +379,15 @@ class TransformerEncoderLayer(nn.Module):
                     src_mask: Optional[Tensor] = None,
                     src_key_padding_mask: Optional[Tensor] = None,
                     pos: Optional[Tensor] = None):
-        pass
+        src2 = self.norm1(src)
+        q = k = self.with_pos_embed(src2, pos)
+        src2 = self.self_attn(q, k, value=src2, attn_mask=src_mask,
+                              key_padding_mask=src_key_padding_mask)[0]
+        src = src + self.dropout1(src2)
+        src2 = self.norm2(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
+        src = src + self.dropout2(src2)
+        return src
 
     def forward(self, src,
                 src_mask: Optional[Tensor] = None,
@@ -429,7 +453,7 @@ def _get_activation_fn(activation):
     if activation == "glu":
         return F.glu
     if activation == "prelu":
-        return nn.PReLU()
+        return F.relu
     if activation == "selu":
         return F.selu
     raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
