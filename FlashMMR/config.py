@@ -148,6 +148,13 @@ class BaseOptions(object):
                             help="weight for saliency loss, set to 0 will ignore")
         parser.add_argument("--lw_ms_align", type=float, default=1.,
                             help="weight for saliency loss, set to 0 will ignore")
+        
+        # * W&B Integration
+        parser.add_argument("--use_wandb", action="store_true", help="enable Weights & Biases logging")
+        parser.add_argument("--wandb_project", type=str, default="FlashMMR", help="W&B project name")
+        parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity/team name")
+        parser.add_argument("--wandb_name", type=str, default=None, help="W&B specific run name")
+        parser.add_argument("--wandb_host", type=str, default="https://pyler.wandb.io", help="W&B enterprise host")
         parser.add_argument("--lw_pv", type=float, default=0.7,
                             help="weight for pv loss, set to 0 will ignore")
         parser.add_argument("--lw_pv1", type=float, default=9.,
@@ -204,6 +211,8 @@ class BaseOptions(object):
             # opt.no_core_driver = True
             if opt.eval_results_dir is not None:
                 opt.results_dir = opt.eval_results_dir
+            else:
+                opt.results_dir = opt.model_dir
         else:
             if opt.exp_id is None:
                 raise ValueError("--exp_id is required for at a training option!")

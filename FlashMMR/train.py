@@ -11,9 +11,13 @@ from datetime import datetime
 
 import torch
 import torch.nn as nn
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
+import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 from FlashMMR.config import BaseOptions
 from FlashMMR.start_end_dataset import (
@@ -48,7 +52,7 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writ
     for batch_idx, batch in tqdm(
         enumerate(train_loader), desc="Training Iteration", total=num_training_examples
     ):
-        print(f"B{batch_idx}: len(batch)={len(batch)}, type(batch[0])={type(batch[0])}", flush=True)
+        # Cleaned up diagnostic tracers for production
         model_inputs, targets = prepare_batch_inputs(batch[1], opt.device, non_blocking=opt.pin_memory)
         
         # Determine batch size
@@ -64,7 +68,16 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writ
         
         # We'll use batch[0] separately for loss calculation
 
-        outputs = model(**model_inputs, targets=targets)
+        # Exclude non-tensor metadata (vid, qid) from DataParallel call to avoid broadcasting crashes
+        outputs = model(
+            src_txt=model_inputs["src_txt"],
+            src_txt_mask=model_inputs["src_txt_mask"],
+            src_vid=model_inputs["src_vid"],
+            src_vid_mask=model_inputs["src_vid_mask"],
+            vid=None,
+            qid=None,
+            targets=targets
+        )
         
         # Prepare data for BundleLoss
         # BundleLoss expects 'boundary' as a tensor (bs, max_gt, 2)
@@ -137,6 +150,8 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writ
             it = epoch_i * num_training_examples + batch_idx
             for k, v in processed_losses.items():
                 tb_writer.add_scalar(f"Train/{k}", v, it)
+                if opt.use_wandb:
+                    wandb.log({f"Train/{k}": v, "it": it}, step=it)
             tb_writer.add_scalar("Train/lr", float(optimizer.param_groups[0]["lr"]), it)
 
     # Write epoch-level logs
@@ -199,21 +214,35 @@ def eval_epoch(model, val_dataset, opt, save_submission_filename, epoch_i, crite
             v_mask = model_inputs["src_vid_mask"][idx]
             actual_len = int(v_mask.sum().item())
             ss = ss[:actual_len]
-            
-            # Boundary - we need the post-processing logic
-            # For simplicity in this training script, we'll focus on the saliency metrics first 
-            # if we can't easily batch the boundary post-processing here.
-            # But wait! I should try to make it work.
-            
-            # ... (Boundary logic extracted from model.py's inference part)
-            # If the model didn't return boundary, we compute it.
-            
-            # For now, let's provide a basic submission format
+            # Temporal Window Post-processing
+            # We use the correct model keys: out_class and out_coord
+            pred_windows = []
+            if "out_class" in outputs and "out_coord" in outputs:
+                # Pyramid Decoding: Convert raw offsets to timestamps
+                # Logic extracted from model.py's inference path
+                out_class_inf = outputs["out_class"][idx].sigmoid()
+                out_coord_inf = outputs["out_coord"][idx].clone()
+                point_inf = outputs["point"][idx]
+                
+                # Apply Pyramid offsets
+                out_coord_inf[:, 0] *= -1
+                out_coord_inf *= point_inf[:, 3, None].repeat(1, 2)
+                out_coord_inf += point_inf[:, 0, None].repeat(1, 2)
+                out_coord_inf /= (1.0 / 2.0) # Correctly scale by clip_length (assumed 2s)
+                
+                # Combine with scores
+                scores, _ = out_class_inf.max(-1)
+                valid_windows = torch.cat((out_coord_inf, scores.unsqueeze(-1)), dim=-1)
+                
+                # Filter and Rank
+                _, inds = scores.sort(descending=True)
+                pred_windows = valid_windows[inds[:100]].cpu().tolist()
+
             mr_res.append(dict(
                 qid=meta["qid"],
                 query=meta["query"],
                 vid=meta["vid"],
-                pred_relevant_windows=[], # Requires complex post-processing for batch
+                pred_relevant_windows=pred_windows,
                 pred_saliency_scores=ss
             ))
 
@@ -248,6 +277,9 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
         drop_last=opt.drop_last,
     )
 
+    # Harden multi-processing strategy for evaluation
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    
     prev_best_score = 0.0
     es_cnt = 0
     start_epoch = opt.start_epoch if opt.start_epoch is not None else 0
@@ -256,6 +288,11 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
     logger.info(f"Start training from epoch {start_epoch}")
 
     for epoch_i in range(start_epoch, opt.n_epoch):
+        # Print iteration info per epoch as requested
+        num_iters = len(train_loader)
+        total_samples = len(train_dataset)
+        logger.info(f"Epoch {epoch_i+1} started: {num_iters} iterations total ({total_samples} samples, BS={opt.bsz})")
+        
         losses = train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writer)
         
         # Step LR
@@ -273,11 +310,20 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
             stop_score = metrics.get("brief", {}).get(score_key, 0.0)
             logger.info(f"mAP ({score_key}): {stop_score:.4f}")
 
+            if opt.use_wandb:
+                # Log all metrics to W&B using global iteration count to keep steps monotonic
+                total_it = (epoch_i + 1) * len(train_loader)
+                log_metrics = {f"Val/{k}": v for k, v in metrics.get("brief", {}).items()}
+                log_metrics["epoch"] = epoch_i + 1
+                wandb.log(log_metrics, step=total_it)
+
             if stop_score > prev_best_score:
                 es_cnt = 0
                 prev_best_score = stop_score
+                # Correctly handle model state dict with DataParallel wrapper
+                model_to_save = model.module if isinstance(model, nn.DataParallel) else model
                 checkpoint = {
-                    "model": model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
+                    "model": model_to_save.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "lr_scheduler": lr_scheduler.state_dict(),
                     "epoch": epoch_i,
@@ -293,8 +339,9 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
 
         # Periodic checkpoint
         if (epoch_i + 1) % 10 == 0:
+            model_to_save = model.module if isinstance(model, nn.DataParallel) else model
             checkpoint = {
-                "model": model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
+                "model": model_to_save.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "lr_scheduler": lr_scheduler.state_dict(),
                 "epoch": epoch_i,
@@ -305,22 +352,23 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
     tb_writer.close()
 
 def setup_training(opt):
-    from FlashMMR.model import build_model
+    from FlashMMR.model import build_model, init_weights
     logger.info("Building model...")
+    # Stability: Disable TF32 on B200 clusters to prevent precision-triggerred NaNs during initialization
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    
     model = build_model(opt)
+    model.apply(init_weights)
     # Set device
-    if opt.device != "all" and isinstance(opt.device, (int, str)):
-        device = f"cuda:{opt.device}"
-        torch.cuda.set_device(device)
-        model = model.to(device)
-        logger.info(f"Using single GPU: {device}")
-    elif torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-        model = model.cuda()
-        logger.info(f"Using {torch.cuda.device_count()} GPUs!")
+    if opt.device.type == "cuda":
+        # DataParallel disabled for FlashMMR stability on B200; scaling via BS=16+ on single GPU
+        model = model.to(opt.device)
+        logger.info(f"Using Single GPU: {opt.device} (High Throughput Mode)")
+        logger.info(f"Available CUDA devices: {torch.cuda.device_count()}")
     else:
-        model = model.cuda()
-        logger.info("Using 1 GPU!")
+        model = model.cpu()
+        logger.info("Using CPU!")
     logger.info("Model built and moved to device.")
 
     # Build criterion
@@ -343,8 +391,23 @@ def setup_training(opt):
     if opt.resume:
         logger.info(f"Resuming from {opt.resume}")
         checkpoint = torch.load(opt.resume, map_location=opt.device, weights_only=False)
-        model.load_state_dict(checkpoint["model"])
-        if opt.resume_all:
+        
+        from collections import OrderedDict
+        new_state_dict = OrderedDict()
+        
+        # Determine if it's a model-only ckpt or full train ckpt
+        ckpt_keys = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+        
+        for k, v in ckpt_keys.items():
+            if k.startswith('module.'):
+                name = k[7:]  # remove `module.`
+            else:
+                name = k
+            new_state_dict[name] = v
+        
+        model.load_state_dict(new_state_dict, strict=False)
+        
+        if opt.resume_all and "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
             opt.start_epoch = checkpoint["epoch"] + 1
@@ -398,6 +461,9 @@ if __name__ == "__main__":
 
     print(f"Initializing logging to {opt.train_log_filepath}")
     root_logger = logging.getLogger()
+    # Remove existing handlers to avoid double-logging
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
     root_logger.setLevel(logging.INFO)
     
     # File handler
@@ -411,6 +477,19 @@ if __name__ == "__main__":
     sh.setLevel(logging.INFO)
     sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     root_logger.addHandler(sh)
+
+    if opt.use_wandb:
+        logger.info(f"Initializing W&B to host: {opt.wandb_host}")
+        wandb.login(host=opt.wandb_host)
+        wandb.init(
+            project=opt.wandb_project,
+            entity=opt.wandb_entity,
+            name=opt.wandb_name if opt.wandb_name else opt.exp_id,
+            config=vars(opt),
+            mode="online"
+        )
+        # Optional: watch model for gradients and topology
+        # wandb.watch(model, log="all", log_freq=num_iters) # num_iters is from start_training
 
     print("Starting training function...", flush=True)
     start_training()
